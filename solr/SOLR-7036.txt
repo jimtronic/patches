@@ -1,0 +1,784 @@
+Index: core/src/java/org/apache/solr/request/SimpleFacets.java
+===================================================================
+--- core/src/java/org/apache/solr/request/SimpleFacets.java	(revision 1658487)
++++ core/src/java/org/apache/solr/request/SimpleFacets.java	(working copy)
+@@ -22,6 +22,7 @@
+ import java.util.Collection;
+ import java.util.Date;
+ import java.util.EnumSet;
++import java.util.HashSet;
+ import java.util.IdentityHashMap;
+ import java.util.List;
+ import java.util.Map;
+@@ -58,7 +59,6 @@
+ import org.apache.lucene.util.BytesRef;
+ import org.apache.lucene.util.BytesRefBuilder;
+ import org.apache.lucene.util.CharsRef;
+-import org.apache.lucene.util.CharsRefBuilder;
+ import org.apache.lucene.util.StringHelper;
+ import org.apache.lucene.util.UnicodeUtil;
+ import org.apache.solr.common.SolrException;
+@@ -334,10 +334,45 @@
+     return collector.getGroupCount();
+   }
+ 
++  /**
++   * Returns a map of doc ids to the grouping value. This is used later when attempting to count unique facet
++   * values within a group.
++   *
++   * @see GroupParams#GROUP_FACET
++   */
++  public int[] getGroupMap(String fieldName, DocSet baseDocs) throws IOException {
++    int[] groupMap = new int[searcher.maxDoc()+1];
++
++    SortedDocValues si = FieldCache.DEFAULT.getTermsIndex(searcher.getAtomicReader(), fieldName);
++
++    int startTermIndex, endTermIndex;
++    startTermIndex=-1;
++    endTermIndex=si.getValueCount();
++
++    final int nTerms=endTermIndex-startTermIndex;
++    if (nTerms>0 && baseDocs.size() >= 0) {
++
++      DocIterator iter = baseDocs.iterator();
++
++      while (iter.hasNext()) {
++        int doc = iter.nextDoc();
++        int term = si.getOrd(doc);
++        int arrIdx = term - startTermIndex;
++        if (arrIdx >= 0 && arrIdx < nTerms) groupMap[doc] = arrIdx;
++      }
++    }
++
++    return groupMap;
++  }
++
+   enum FacetMethod {
+     ENUM, FC, FCS;
+   }
+ 
++  enum GroupFacetMethod {
++    ORIGINAL, FC;
++  }
++
+   /**
+    * Term counts for use in pivot faceting that resepcts the appropriate mincount
+    * @see FacetParams#FACET_PIVOT_MINCOUNT
+@@ -443,8 +478,19 @@
+       method = FacetMethod.FC;
+     }
+ 
++    final String groupFacetMethodStr = params.getFieldParam(field,  GroupParams.GROUP_FACET_METHOD);
++    GroupFacetMethod groupFacetMethod = GroupFacetMethod.ORIGINAL;
++
++    if (GroupParams.GROUP_FACET_METHOD_original.equals(groupFacetMethodStr)) {
++      groupFacetMethod = GroupFacetMethod.ORIGINAL;
++    } else if (GroupParams.GROUP_FACET_METHOD_fc.equals(groupFacetMethodStr)) {
++      groupFacetMethod = GroupFacetMethod.FC;
++    }
++
+     if (params.getFieldBool(field, GroupParams.GROUP_FACET, false)) {
+-      counts = getGroupedCounts(searcher, base, field, multiToken, offset,limit, mincount, missing, sort, prefix);
++
++      counts = getGroupedCounts(searcher, base, field, multiToken, offset,limit, mincount, missing, sort, prefix, groupFacetMethod);
++
+     } else {
+       assert method != null;
+       switch (method) {
+@@ -494,43 +540,62 @@
+                                              int mincount,
+                                              boolean missing,
+                                              String sort,
+-                                             String prefix) throws IOException {
++                                             String prefix,
++                                             GroupFacetMethod groupFacetMethod) throws IOException {
+     GroupingSpecification groupingSpecification = rb.getGroupingSpec();
+-    String groupField  = groupingSpecification != null ? groupingSpecification.getFields()[0] : null;
+-    if (groupField == null) {
+-      throw new SolrException (
++
++    if (groupingSpecification == null || groupingSpecification.getFields().length == 0) {
++      throw new SolrException(
+           SolrException.ErrorCode.BAD_REQUEST,
+           "Specify the group.field as parameter or local parameter"
+       );
+     }
+ 
+-    BytesRef prefixBR = prefix != null ? new BytesRef(prefix) : null;
+-    TermGroupFacetCollector collector = TermGroupFacetCollector.createTermGroupFacetCollector(groupField, field, multiToken, prefixBR, 128);
+-    searcher.search(new MatchAllDocsQuery(), base.getTopFilter(), collector);
+-    boolean orderByCount = sort.equals(FacetParams.FACET_SORT_COUNT) || sort.equals(FacetParams.FACET_SORT_COUNT_LEGACY);
+-    TermGroupFacetCollector.GroupedFacetResult result 
+-      = collector.mergeSegmentResults(limit < 0 ? Integer.MAX_VALUE : 
+-                                      (offset + limit), 
+-                                      mincount, orderByCount);
++    String groupField = groupingSpecification != null ? groupingSpecification.getFields()[0] : null;
+ 
+-    CharsRef charsRef = new CharsRef();
+-    FieldType facetFieldType = searcher.getSchema().getFieldType(field);
+-    NamedList<Integer> facetCounts = new NamedList<>();
+-    List<TermGroupFacetCollector.FacetEntry> scopedEntries 
+-      = result.getFacetEntries(offset, limit < 0 ? Integer.MAX_VALUE : limit);
+-    for (TermGroupFacetCollector.FacetEntry facetEntry : scopedEntries) {
+-      facetFieldType.indexedToReadable(facetEntry.getValue(), charsRef);
+-      facetCounts.add(charsRef.toString(), facetEntry.getCount());
+-    }
++    if (groupFacetMethod == GroupFacetMethod.FC) {
++      int[] groupMap = getGroupMap(groupField, base);
++      UnInvertedField uif = UnInvertedField.getUnInvertedFieldForGroupFaceting(field, groupField, searcher);
++      NamedList<Integer> facetCounts = uif.getGroupCounts(searcher, base, groupMap, offset, limit, mincount, missing, sort, prefix);
+ 
+-    if (missing) {
+-      facetCounts.add(null, result.getTotalMissingCount());
++      return facetCounts;
++    } else {
++
++      BytesRef prefixBR = prefix != null ? new BytesRef(prefix) : null;
++      TermGroupFacetCollector collector = TermGroupFacetCollector.createTermGroupFacetCollector(groupField, field, multiToken, prefixBR, 128);
++
++      Query matchAll = new MatchAllDocsQuery();
++
++      Filter filter = base.getTopFilter();
++
++      searcher.search(matchAll, filter, collector);
++
++      boolean orderByCount = sort.equals(FacetParams.FACET_SORT_COUNT) || sort.equals(FacetParams.FACET_SORT_COUNT_LEGACY);
++      TermGroupFacetCollector.GroupedFacetResult result
++          = collector.mergeSegmentResults(limit < 0 ? Integer.MAX_VALUE :
++              (offset + limit),
++          mincount, orderByCount
++      );
++
++      CharsRef charsRef = new CharsRef();
++      FieldType facetFieldType = searcher.getSchema().getFieldType(field);
++
++      NamedList<Integer> facetCounts = new NamedList<>();
++      List<TermGroupFacetCollector.FacetEntry> scopedEntries
++          = result.getFacetEntries(offset, limit < 0 ? Integer.MAX_VALUE : limit);
++      for (TermGroupFacetCollector.FacetEntry facetEntry : scopedEntries) {
++        facetFieldType.indexedToReadable(facetEntry.getValue(), charsRef);
++        facetCounts.add(charsRef.toString(), facetEntry.getCount());
++      }
++
++      if (missing) {
++        facetCounts.add(null, result.getTotalMissingCount());
++      }
++
++      return facetCounts;
+     }
+-
+-    return facetCounts;
+   }
+ 
+-
+   static final Executor directExecutor = new Executor() {
+     @Override
+     public void execute(Runnable r) {
+@@ -564,6 +629,10 @@
+       return res;
+     }
+ 
++    // Need to create the term grouping map here and send into these threads.
++   // final NamedList<ArrayList> groupSets = getGroupSets(rb.getGroupingSpec().getFields()[0], this.docs);
++
++
+     // Passing a negative number for FACET_THREADS implies an unlimited number of threads is acceptable.
+     // Also, a subtlety of directExecutor is that no matter how many times you "submit" a job, it's really
+     // just a method call in that it's run by the calling thread.
+@@ -580,6 +649,7 @@
+         final String workerKey = key;
+         final String workerFacetValue = facetValue;
+         final DocSet workerBase = this.docs;
++
+         Callable<NamedList> callable = new Callable<NamedList>() {
+           @Override
+           public NamedList call() throws Exception {
+@@ -819,7 +889,155 @@
+     return res;
+   }
+ 
++  /**
++   * Use the Lucene FieldCache to get counts for each unique field value in <code>docs</code>.
++   * The field must have at most one indexed token per document.
++   */
++  public static NamedList<Integer> getGroupedFieldCacheCounts(SolrIndexSearcher searcher, DocSet docs, int[] groupMap, String fieldName, int offset, int limit, int mincount, boolean missing, String sort, String prefix) throws IOException {
+ 
++    FieldType ft = searcher.getSchema().getFieldType(fieldName);
++    NamedList<Integer> res = new NamedList<>();
++
++    SortedDocValues si = FieldCache.DEFAULT.getTermsIndex(searcher.getAtomicReader(), fieldName);
++
++    BytesRef br = new BytesRef();
++
++    final BytesRefBuilder prefixRef;
++    if (prefix == null) {
++      prefixRef = null;
++    } else if (prefix.length()==0) {
++      prefix = null;
++      prefixRef = null;
++    } else {
++      prefixRef = new BytesRefBuilder();
++      prefixRef.copyChars(prefix);
++    }
++
++    int startTermIndex, endTermIndex;
++    if (prefix!=null) {
++      startTermIndex = si.lookupTerm(prefixRef.get());
++      if (startTermIndex<0) startTermIndex=-startTermIndex-1;
++      prefixRef.append(UnicodeUtil.BIG_TERM);
++      endTermIndex = si.lookupTerm(prefixRef.get());
++      assert endTermIndex < 0;
++      endTermIndex = -endTermIndex-1;
++    } else {
++      startTermIndex=-1;
++      endTermIndex=si.getValueCount();
++    }
++
++    final int nTerms=endTermIndex-startTermIndex;
++    int missingCount = -1;
++    final CharsRef charsRef = new CharsRef();
++    if (nTerms>0 && docs.size() >= mincount) {
++
++      // count collection array only needs to be as big as the number of terms we are
++      // going to collect counts for.
++      final int[] counts = new int[nTerms];
++      final java.util.HashSet<Integer>[] facetGroups = new HashSet[nTerms];
++
++      DocIterator iter = docs.iterator();
++
++      while (iter.hasNext()) {
++        int doc = iter.nextDoc();
++        int term = si.getOrd(doc);
++        int arrIdx = term-startTermIndex;
++        if (arrIdx>=0 && arrIdx<nTerms) {
++          if (facetGroups[arrIdx] == null) {
++            facetGroups[arrIdx] = new HashSet<Integer>();
++          }
++          facetGroups[arrIdx].add(groupMap[doc]);
++        }
++      }
++
++      for(int i=0; i < facetGroups.length; i++) {
++        if (facetGroups[i] != null) {
++          counts[i] = facetGroups[i].size();
++        }
++      }
++
++
++      if (startTermIndex == -1) {
++        missingCount = counts[0];
++      }
++
++      // IDEA: we could also maintain a count of "other"... everything that fell outside
++      // of the top 'N'
++
++      int off=offset;
++      int lim=limit>=0 ? limit : Integer.MAX_VALUE;
++
++      if (sort.equals(FacetParams.FACET_SORT_COUNT) || sort.equals(FacetParams.FACET_SORT_COUNT_LEGACY)) {
++        int maxsize = limit>0 ? offset+limit : Integer.MAX_VALUE-1;
++        maxsize = Math.min(maxsize, nTerms);
++        LongPriorityQueue queue = new LongPriorityQueue(Math.min(maxsize,1000), maxsize, Long.MIN_VALUE);
++
++        int min=mincount-1;  // the smallest value in the top 'N' values
++        for (int i=(startTermIndex==-1)?1:0; i<nTerms; i++) {
++          int c = counts[i];
++          if (c>min) {
++            // NOTE: we use c>min rather than c>=min as an optimization because we are going in
++            // index order, so we already know that the keys are ordered.  This can be very
++            // important if a lot of the counts are repeated (like zero counts would be).
++
++            // smaller term numbers sort higher, so subtract the term number instead
++            long pair = (((long)c)<<32) + (Integer.MAX_VALUE - i);
++            boolean displaced = queue.insert(pair);
++            if (displaced) min=(int)(queue.top() >>> 32);
++          }
++        }
++
++        // if we are deep paging, we don't have to order the highest "offset" counts.
++        int collectCount = Math.max(0, queue.size() - off);
++        assert collectCount <= lim;
++
++        // the start and end indexes of our list "sorted" (starting with the highest value)
++        int sortedIdxStart = queue.size() - (collectCount - 1);
++        int sortedIdxEnd = queue.size() + 1;
++        final long[] sorted = queue.sort(collectCount);
++
++        for (int i=sortedIdxStart; i<sortedIdxEnd; i++) {
++          long pair = sorted[i];
++          int c = (int)(pair >>> 32);
++          int tnum = Integer.MAX_VALUE - (int)pair;
++          br = si.lookupOrd(startTermIndex+tnum);
++          ft.indexedToReadable(br, charsRef);
++          res.add(charsRef.toString(), c);
++        }
++
++      } else {
++        // add results in index order
++        int i=(startTermIndex==-1)?1:0;
++        if (mincount<=0) {
++          // if mincount<=0, then we won't discard any terms and we know exactly
++          // where to start.
++          i+=off;
++          off=0;
++        }
++
++        for (; i<nTerms; i++) {
++          int c = counts[i];
++          if (c<mincount || --off>=0) continue;
++          if (--lim<0) break;
++          br = si.lookupOrd(startTermIndex+i);
++          ft.indexedToReadable(br, charsRef);
++          res.add(charsRef.toString(), c);
++        }
++      }
++    }
++
++    if (missing) {
++      if (missingCount < 0) {
++        missingCount = getFieldMissingCount(searcher,docs,fieldName);
++      }
++      res.add(null, missingCount);
++    }
++
++    return res;
++  }
++
++
++
+   /**
+    * Returns a list of terms in the specified field along with the 
+    * corresponding count of documents in the set that match that constraint.
+Index: core/src/java/org/apache/solr/request/UnInvertedField.java
+===================================================================
+--- core/src/java/org/apache/solr/request/UnInvertedField.java	(revision 1658487)
++++ core/src/java/org/apache/solr/request/UnInvertedField.java	(working copy)
+@@ -18,10 +18,10 @@
+ package org.apache.solr.request;
+ 
+ import java.io.IOException;
++import java.util.HashSet;
+ import java.util.LinkedHashMap;
+ import java.util.Map;
+ import java.util.concurrent.atomic.AtomicLong;
+-
+ import org.apache.lucene.index.AtomicReader;
+ import org.apache.lucene.index.DocTermOrds;
+ import org.apache.lucene.index.SortedDocValues;
+@@ -209,6 +209,39 @@
+     //System.out.println("CREATED: " + toString() + " ti.index=" + ti.index);
+   }
+ 
++  public UnInvertedField(String field, String groupField, SolrIndexSearcher searcher) throws IOException {
++    super(field,
++          /* In order for group faceting to work correctly,
++          we need to uninvert the entire field, and not skip the top terms. */
++          Integer.MAX_VALUE,
++          DEFAULT_INDEX_INTERVAL_BITS);
++
++    final String prefix = TrieField.getMainValuePrefix(searcher.getSchema().getFieldType(field));
++    this.searcher = searcher;
++    try {
++      AtomicReader r = searcher.getAtomicReader();
++      uninvert(r, r.getLiveDocs(), prefix == null ? null : new BytesRef(prefix));
++    } catch (IllegalStateException ise) {
++      throw new SolrException(SolrException.ErrorCode.BAD_REQUEST, ise.getMessage());
++    }
++    if (tnums != null) {
++      for(byte[] target : tnums) {
++        if (target != null && target.length > (1<<24)*.9) {
++          SolrCore.log.warn("Approaching too many values for UnInvertedField faceting on field '"+field+"' : bucket size=" + target.length);
++        }
++      }
++    }
++
++    // free space if outrageously wasteful (tradeoff memory/cpu)
++    if ((maxTermCounts.length - numTermsInField) > 1024) { // too much waste!
++      int[] newMaxTermCounts = new int[numTermsInField];
++      System.arraycopy(maxTermCounts, 0, newMaxTermCounts, 0, numTermsInField);
++      maxTermCounts = newMaxTermCounts;
++    }
++
++    SolrCore.log.info("UnInverted multi-valued field " + toString() + " for group faceting on group field " + groupField);
++  }
++
+   public int getNumTerms() {
+     return numTermsInField;
+   }
+@@ -458,6 +491,206 @@
+     return res;
+   }
+ 
++  public NamedList<Integer> getGroupCounts(SolrIndexSearcher searcher, DocSet baseDocs, int[] groupMap, int offset, int limit, Integer mincount, boolean missing, String sort, String prefix) throws IOException {
++    use.incrementAndGet();
++
++    FieldType ft = searcher.getSchema().getFieldType(field);
++
++    NamedList<Integer> res = new NamedList<>();  // order is important
++
++    DocSet docs = baseDocs;
++    int baseSize = docs.size();
++    int maxDoc = searcher.maxDoc();
++
++    if (baseSize >= mincount) {
++
++      final int[] index = this.index;
++      final int[] counts = new int[numTermsInField + 1];
++      final java.util.HashSet<Integer>[] facetGroups = new HashSet[numTermsInField + 1];
++
++      //
++      // If there is prefix, find it's start and end term numbers
++      //
++      int startTerm = 0;
++      int endTerm = numTermsInField;  // one past the end
++
++      TermsEnum te = getOrdTermsEnum(searcher.getAtomicReader());
++
++      if (te != null && prefix != null && prefix.length() > 0) {
++        final BytesRefBuilder prefixBr = new BytesRefBuilder();
++        prefixBr.copyChars(prefix);
++        if (te.seekCeil(prefixBr.get()) == TermsEnum.SeekStatus.END) {
++          startTerm = numTermsInField;
++        } else {
++          startTerm = (int) te.ord();
++        }
++        prefixBr.append(UnicodeUtil.BIG_TERM);
++        if (te.seekCeil(prefixBr.get()) == TermsEnum.SeekStatus.END) {
++          endTerm = numTermsInField;
++        } else {
++          endTerm = (int) te.ord();
++        }
++      }
++
++      boolean doNegative = false;
++
++      if (termInstances > 0) {
++        DocIterator iter = docs.iterator();
++        while (iter.hasNext()) {
++          int doc = iter.nextDoc();
++          //System.out.println("iter doc=" + doc);
++          int code = index[doc];
++
++          if ((code & 0xff)==1) {
++            //System.out.println("  ptr");
++            int pos = code>>>8;
++            int whichArray = (doc >>> 16) & 0xff;
++            byte[] arr = tnums[whichArray];
++            int tnum = 0;
++            for(;;) {
++              int delta = 0;
++              for(;;) {
++                byte b = arr[pos++];
++                delta = (delta << 7) | (b & 0x7f);
++                if ((b & 0x80) == 0) break;
++              }
++              if (delta == 0) break;
++              tnum += delta - TNUM_OFFSET;
++              //System.out.println("    tnum=" + tnum);
++              if (facetGroups[tnum] == null) {
++                facetGroups[tnum] = new HashSet<Integer>();
++              }
++              facetGroups[tnum].add(groupMap[doc]);
++            }
++          } else {
++            //System.out.println("  inlined");
++            int tnum = 0;
++            int delta = 0;
++            for (;;) {
++              delta = (delta << 7) | (code & 0x7f);
++              if ((code & 0x80)==0) {
++                if (delta==0) break;
++                tnum += delta - TNUM_OFFSET;
++                //System.out.println("    tnum=" + tnum);
++                if (facetGroups[tnum] == null) {
++                  facetGroups[tnum] = new HashSet<Integer>();
++                }
++                facetGroups[tnum].add(groupMap[doc]);
++                delta = 0;
++              }
++              code >>>= 8;
++            }
++          }
++        }
++      }
++
++      for(int i=0; i < facetGroups.length; i++) {
++        if (facetGroups[i] != null) {
++          counts[i] = facetGroups[i].size();
++        }
++      }
++
++      final CharsRef charsRef = new CharsRef();
++
++      int off=offset;
++      int lim=limit>=0 ? limit : Integer.MAX_VALUE;
++
++      if (sort.equals(FacetParams.FACET_SORT_COUNT) || sort.equals(FacetParams.FACET_SORT_COUNT_LEGACY)) {
++        int maxsize = limit>0 ? offset+limit : Integer.MAX_VALUE-1;
++        maxsize = Math.min(maxsize, numTermsInField);
++        LongPriorityQueue queue = new LongPriorityQueue(Math.min(maxsize,1000), maxsize, Long.MIN_VALUE);
++
++        int min=mincount-1;  // the smallest value in the top 'N' values
++        for (int i=startTerm; i<endTerm; i++) {
++          int c = doNegative ? maxTermCounts[i] - counts[i] : counts[i];
++          if (c>min) {
++            long pair = (((long)c)<<32) + (Integer.MAX_VALUE - i);
++            boolean displaced = queue.insert(pair);
++            if (displaced) min=(int)(queue.top() >>> 32);
++          }
++        }
++
++        // now select the right page from the results
++        // if we are deep paging, we don't have to order the highest "offset" counts.
++        int collectCount = Math.max(0, queue.size() - off);
++        assert collectCount <= lim;
++
++        // the start and end indexes of our list "sorted" (starting with the highest value)
++        int sortedIdxStart = queue.size() - (collectCount - 1);
++        int sortedIdxEnd = queue.size() + 1;
++        final long[] sorted = queue.sort(collectCount);
++
++        final int[] indirect = counts;  // reuse the counts array for the index into the tnums array
++        assert indirect.length >= sortedIdxEnd;
++
++        for (int i=sortedIdxStart; i<sortedIdxEnd; i++) {
++          long pair = sorted[i];
++          int c = (int)(pair >>> 32);
++          int tnum = Integer.MAX_VALUE - (int)pair;
++
++          indirect[i] = i;   // store the index for indirect sorting
++          sorted[i] = tnum;  // reuse the "sorted" array to store the term numbers for indirect sorting
++
++          // add a null label for now... we'll fill it in later.
++          res.add(null, c);
++        }
++
++        // now sort the indexes by the term numbers
++        PrimUtils.sort(sortedIdxStart, sortedIdxEnd, indirect, new PrimUtils.IntComparator() {
++          @Override
++          public int compare(int a, int b) {
++            return (int)sorted[a] - (int)sorted[b];
++          }
++
++          @Override
++          public boolean lessThan(int a, int b) {
++            return sorted[a] < sorted[b];
++          }
++
++          @Override
++          public boolean equals(int a, int b) {
++            return sorted[a] == sorted[b];
++          }
++        });
++
++        // convert the term numbers to term values and set
++        // as the label
++        for (int i=sortedIdxStart; i<sortedIdxEnd; i++) {
++          int idx = indirect[i];
++          int tnum = (int)sorted[idx];
++          final String label = getReadableValue(getTermValue(te, tnum), ft, charsRef);
++          //System.out.println("  label=" + label);
++          res.setName(idx - sortedIdxStart, label);
++        }
++
++      } else {
++        // add results in index order
++        int i=startTerm;
++        if (mincount<=0) {
++          // if mincount<=0, then we won't discard any terms and we know exactly
++          // where to start.
++          i=startTerm+off;
++          off=0;
++        }
++
++        for (; i<endTerm; i++) {
++          int c = doNegative ? maxTermCounts[i] - counts[i] : counts[i];
++          if (c<mincount || --off>=0) continue;
++          if (--lim<0) break;
++
++          final String label = getReadableValue(getTermValue(te, i), ft, charsRef);
++          res.add(label, c);
++        }
++      }
++    }
++
++    if (missing) {
++      res.add(null, SimpleFacets.getFieldMissingCount(searcher, baseDocs, field));
++    }
++
++    return res;
++  }
++
+   /**
+    * Collect statistics about the UninvertedField.  Code is very similar to {@link #getCounts(org.apache.solr.search.SolrIndexSearcher, org.apache.solr.search.DocSet, int, int, Integer, boolean, String, String)}
+    * It can be used to calculate stats on multivalued fields.
+@@ -708,4 +941,56 @@
+ 
+     return uif;
+   }
++
++  //////////////////////////////////////////////////////////////////
++  //////////////////////////// caching /////////////////////////////
++  //////////////////////////////////////////////////////////////////
++
++  public static UnInvertedField getUnInvertedFieldForGroupFaceting(String field, String groupField, SolrIndexSearcher searcher) throws IOException {
++    String cacheKey = field + ":" + groupField;
++    SolrCache<String,UnInvertedField> cache = searcher.getFieldValueCache();
++    if (cache == null) {
++      return new UnInvertedField(cacheKey, searcher);
++    }
++    UnInvertedField uif = null;
++    Boolean doWait = false;
++    synchronized (cache) {
++      uif = cache.get(cacheKey);
++      if (uif == null) {
++        /**
++         * We use this place holder object to pull the UninvertedField construction out of the sync
++         * so that if many fields are accessed in a short time, the UninvertedField can be
++         * built for these fields in parallel rather than sequentially.
++         */
++        cache.put(cacheKey, uifPlaceholder);
++      } else {
++        if (uif != uifPlaceholder) {
++          return uif;
++        }
++        doWait = true; // Someone else has put the place holder in, wait for that to complete.
++      }
++    }
++    while (doWait) {
++      try {
++        synchronized (cache) {
++          uif = cache.get(cacheKey); // Should at least return the placeholder, NPE if not is OK.
++          if (uif != uifPlaceholder) { // OK, another thread put this in the cache we should be good.
++            return uif;
++          }
++          cache.wait();
++        }
++      } catch (InterruptedException e) {
++        throw new SolrException(SolrException.ErrorCode.SERVER_ERROR, "Thread interrupted in getUninvertedField.");
++      }
++    }
++
++    uif = new UnInvertedField(field, groupField, searcher);
++    synchronized (cache) {
++      cache.put(cacheKey, uif); // Note, this cleverly replaces the placeholder.
++      cache.notifyAll();
++    }
++
++    return uif;
++  }
+ }
++
+Index: core/src/test/org/apache/solr/TestGroupingSearch.java
+===================================================================
+--- core/src/test/org/apache/solr/TestGroupingSearch.java	(revision 1658487)
++++ core/src/test/org/apache/solr/TestGroupingSearch.java	(working copy)
+@@ -310,6 +310,7 @@
+     assertU(add(doc("id", "3", "value1_s1", "2", "value2_i", "3", "value3_s1", "b", "value4_i", "2")));
+     assertU(add(doc("id", "4", "value1_s1", "1", "value2_i", "4", "value3_s1", "a", "value4_i", "1")));
+     assertU(add(doc("id", "5", "value1_s1", "2", "value2_i", "5", "value3_s1", "b", "value4_i", "2")));
++    assertU(add(doc("id", "6", "value1_s1", "1", "value2_i", "2", "value3_s1", "a", "value4_i", "2")));
+     assertU(commit());
+ 
+     // Facet counts based on documents
+@@ -317,8 +318,8 @@
+         "value1_s1", "fl", "id", "facet", "true", "facet.field", "value3_s1", "group.truncate", "false");
+     assertJQ(
+         req,
+-        "/grouped=={'value1_s1':{'matches':5,'groups':[{'groupValue':'1','doclist':{'numFound':3,'start':0,'docs':[{'id':'1'}]}}]}}",
+-        "/facet_counts=={'facet_queries':{},'facet_fields':{'value3_s1':['a',3,'b',2]},'facet_dates':{},'facet_ranges':{},'facet_intervals':{}}"
++        "/grouped=={'value1_s1':{'matches':6,'groups':[{'groupValue':'1','doclist':{'numFound':4,'start':0,'docs':[{'id':'1'}]}}]}}",
++        "/facet_counts=={'facet_queries':{},'facet_fields':{'value3_s1':['a',4,'b',2]},'facet_dates':{},'facet_ranges':{},'facet_intervals':{}}"
+     );
+ 
+     // Facet counts based on groups
+@@ -326,7 +327,7 @@
+         "value1_s1", "fl", "id", "facet", "true", "facet.field", "value3_s1", "group.truncate", "true");
+     assertJQ(
+         req,
+-        "/grouped=={'value1_s1':{'matches':5,'groups':[{'groupValue':'1','doclist':{'numFound':3,'start':0,'docs':[{'id':'1'}]}}]}}",
++        "/grouped=={'value1_s1':{'matches':6,'groups':[{'groupValue':'1','doclist':{'numFound':4,'start':0,'docs':[{'id':'1'}]}}]}}",
+         "/facet_counts=={'facet_queries':{},'facet_fields':{'value3_s1':['a',1,'b',1]},'facet_dates':{},'facet_ranges':{},'facet_intervals':{}}"
+     );
+ 
+@@ -335,7 +336,7 @@
+         "strdist(1,value1_s1,edit)", "fl", "id", "facet", "true", "facet.field", "value3_s1", "group.truncate", "true");
+     assertJQ(
+         req,
+-        "/grouped=={'strdist(1,value1_s1,edit)':{'matches':5,'groups':[{'groupValue':1.0,'doclist':{'numFound':3,'start':0,'docs':[{'id':'1'}]}}]}}",
++        "/grouped=={'strdist(1,value1_s1,edit)':{'matches':6,'groups':[{'groupValue':1.0,'doclist':{'numFound':4,'start':0,'docs':[{'id':'1'}]}}]}}",
+         "/facet_counts=={'facet_queries':{},'facet_fields':{'value3_s1':['a',1,'b',1]},'facet_dates':{},'facet_ranges':{},'facet_intervals':{}}"
+     );
+ 
+@@ -344,7 +345,7 @@
+         "facet.field", "value3_s1", "group.truncate", "true");
+     assertJQ(
+         req,
+-        "/grouped=={'value4_i':{'matches':5,'groups':[{'groupValue':1,'doclist':{'numFound':3,'start':0,'docs':[{'id':'1'}]}}]}}",
++        "/grouped=={'value4_i':{'matches':6,'groups':[{'groupValue':1,'doclist':{'numFound':3,'start':0,'docs':[{'id':'1'}]}}]}}",
+         "/facet_counts=={'facet_queries':{},'facet_fields':{'value3_s1':['a',1,'b',1]},'facet_dates':{},'facet_ranges':{},'facet_intervals':{}}"
+     );
+ 
+@@ -357,15 +358,34 @@
+         "/facet_counts=={'facet_queries':{},'facet_fields':{'value3_s1':['a',1,'b',1]},'facet_dates':{},'facet_ranges':{},'facet_intervals':{}}"
+     );
+ 
++    // Multi select facets AND group.facet=true
++    req = req("q", "*:*", "rows", "1", "group", "true", "group.field", "value4_i", "fl", "id", "facet", "true",
++        "facet.field", "{!ex=tagForvalue3_s1}value3_s1", "group.facet.method","fc","group.facet", "true");
++    assertJQ(
++        req,
++        "/grouped=={'value4_i':{'matches':6,'groups':[{'groupValue':1,'doclist':{'numFound':3,'start':0,'docs':[{'id':'1'}]}}]}}\n",
++        "/facet_counts=={'facet_queries':{},'facet_fields':{'value3_s1':['a',2,'b',1]},'facet_dates':{},'facet_ranges':{},'facet_intervals':{}}\n"
++    );
++
++
++    // Multi select facets AND group.facet=true
++    req = req("q", "*:*", "rows", "1", "group", "true", "group.field", "value4_i", "fl", "id", "facet", "true",
++        "facet.field", "{!ex=v}value3_s1", "group.facet.method","fc","group.facet", "true", "fq", "{!tag=v}value3_s1:b");
++    assertJQ(
++        req,
++        "/grouped=={'value4_i':{'matches':2,'groups':[{'groupValue':2,'doclist':{'numFound':2,'start':0,'docs':[{'id':'3'}]}}]}}",
++        "/facet_counts=={'facet_queries':{},'facet_fields':{'value3_s1':['a',2,'b',1]},'facet_dates':{},'facet_ranges':{},'facet_intervals':{}}"
++    );
++    FieldCache.DEFAULT.purgeAllCaches();   // avoid FC insanity
++
+     // Multi select facets AND group.truncate=false
+     req = req("q", "*:*", "rows", "1", "group", "true", "group.field", "value4_i", "fl", "id", "facet", "true",
+         "facet.field", "{!ex=v}value3_s1", "group.truncate", "false", "fq", "{!tag=v}value3_s1:b");
+     assertJQ(
+         req,
+         "/grouped=={'value4_i':{'matches':2,'groups':[{'groupValue':2,'doclist':{'numFound':2,'start':0,'docs':[{'id':'3'}]}}]}}",
+-        "/facet_counts=={'facet_queries':{},'facet_fields':{'value3_s1':['a',3,'b',2]},'facet_dates':{},'facet_ranges':{},'facet_intervals':{}}"
++        "/facet_counts=={'facet_queries':{},'facet_fields':{'value3_s1':['a',4,'b',2]},'facet_dates':{},'facet_ranges':{},'facet_intervals':{}}"
+     );
+-
+     // Multi select facets AND group.truncate=true
+     req = req("q", "*:*", "rows", "1", "group", "true", "group.func", "sub(value4_i,1)", "fl", "id", "facet", "true",
+         "facet.field", "{!ex=v}value3_s1", "group.truncate", "true", "fq", "{!tag=v}value3_s1:b");
+@@ -374,6 +394,7 @@
+         "/grouped=={'sub(value4_i,1)':{'matches':2,'groups':[{'groupValue':1.0,'doclist':{'numFound':2,'start':0,'docs':[{'id':'3'}]}}]}}",
+         "/facet_counts=={'facet_queries':{},'facet_fields':{'value3_s1':['a',1,'b',1]},'facet_dates':{},'facet_ranges':{},'facet_intervals':{}}"
+     );
++
+   }
+ 
+   @Test
+Index: solrj/src/java/org/apache/solr/common/params/GroupParams.java
+===================================================================
+--- solrj/src/java/org/apache/solr/common/params/GroupParams.java	(revision 1658487)
++++ solrj/src/java/org/apache/solr/common/params/GroupParams.java	(working copy)
+@@ -58,6 +58,13 @@
+   /** Whether to compute grouped facets based on the first specified group. */
+   public static final String GROUP_FACET = GROUP + ".facet";
+ 
++  /** Method to use for counting unique facet values within a group */
++  public static final String GROUP_FACET_METHOD = GROUP + ".facet.method";
++
++  public static final String GROUP_FACET_METHOD_original = "original";
++
++  public static final String GROUP_FACET_METHOD_fc = "fc";
++
+   /** Retrieve the top search groups (top group values) from the shards being queried.  */
+   public static final String GROUP_DISTRIBUTED_FIRST = GROUP + ".distributed.first";
+ 
